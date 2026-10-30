@@ -3289,9 +3289,15 @@ public class DexFinder {
     }
 
     public void resolveSnsUploadApi() {
-        if (ensureSnapshotLoaded()) return;
+        boolean snapshotLoaded = ensureSnapshotLoaded();
+        if (snsVideoLocatorResolved
+                && !isSnsAddVideoMethod(snsUploadPackHelperClass, snsAddVideoMethod)) {
+            snsVideoLocatorResolved = false;
+        }
+        if (snapshotLoaded && snsVideoLocatorResolved) return;
         try {
-            if (hasSnsUploadApi() && snsAddVideoMethod != null && snsShareAppMsgMethod != null) {
+            if (snsVideoLocatorResolved && hasSnsUploadApi()
+                    && snsAddVideoMethod != null && snsShareAppMsgMethod != null) {
                 return;
             }
 
@@ -3356,6 +3362,10 @@ public class DexFinder {
     }
 
     private void resolveSnsUploadMethods() {
+        if (snsVideoLocatorResolved
+                && !isSnsAddVideoMethod(snsUploadPackHelperClass, snsAddVideoMethod)) {
+            snsVideoLocatorResolved = false;
+        }
         if (snsUploadPackHelperClass != null) {
             if (snsSetContentMethod == null) {
                 snsSetContentMethod = findSnsHelperChainMethod("setContentDes");
@@ -3369,8 +3379,22 @@ public class DexFinder {
             if (snsAddImageMethod == null) {
                 snsAddImageMethod = findSnsAddImageMethod(snsUploadPackHelperClass);
             }
-            if (snsAddVideoMethod == null) {
-                snsAddVideoMethod = findSnsAddVideoMethod(snsUploadPackHelperClass);
+            if (!snsVideoLocatorResolved) {
+                Method found = findSnsAddVideoMethod(snsUploadPackHelperClass);
+                if (found != null) {
+                    snsAddVideoMethod = found;
+                    if (resolvedAll && cachePrefs != null && runtimeCacheKey.length() > 0
+                            && DexCacheIdentity.sameRuntime(runtimeCacheKey,
+                                    cachePrefs.getString(CACHE_KEY, ""))) {
+                        SharedPreferences.Editor videoLocatorEditor = cachePrefs.edit();
+                        putMethod(videoLocatorEditor, "snsAddVideoMethod", found);
+                        videoLocatorEditor.putString(
+                                SNS_VIDEO_LOCATOR_VERSION_KEY, SNS_VIDEO_LOCATOR_VERSION);
+                        if (!videoLocatorEditor.commit()) {
+                            logDetail("朋友圈视频定位缓存写入失败");
+                        }
+                    }
+                }
             }
             if (snsCommitMethod == null) {
                 snsCommitMethod = findSnsCommitMethod(snsUploadPackHelperClass);
@@ -3387,7 +3411,6 @@ public class DexFinder {
                 snsUploadCheckMethod = findSnsUploadCheckMethod(snsUploadManagerClass);
             }
         }
-        if (snsUploadPackHelperClass == null) snsVideoLocatorResolved = true;
     }
 
     public void resolveChatPageApi() {
@@ -3698,27 +3721,27 @@ public class DexFinder {
             snsSetSdkIdMethod = loadMethod("snsSetSdkIdMethod");
             snsSetSdkAppNameMethod = loadMethod("snsSetSdkAppNameMethod");
             snsAddImageMethod = loadMethod("snsAddImageMethod");
+            // A bad optional video descriptor must not invalidate unrelated cached APIs.
+            boolean cacheInvalidBeforeSnsVideo = cacheDescriptorInvalid;
             snsAddVideoMethod = loadMethod("snsAddVideoMethod");
+            cacheDescriptorInvalid = cacheInvalidBeforeSnsVideo;
             boolean snsVideoLocatorVersionCurrent = SNS_VIDEO_LOCATOR_VERSION.equals(
                     cachePrefs.getString(SNS_VIDEO_LOCATOR_VERSION_KEY, ""));
             if (snsAddVideoMethod != null
                     && !isSnsAddVideoMethod(snsUploadPackHelperClass, snsAddVideoMethod)) {
                 snsAddVideoMethod = null;
-                if (snsVideoLocatorVersionCurrent) cacheDescriptorInvalid = true;
             }
-            if (!snsVideoLocatorVersionCurrent) {
-                if (snsUploadPackHelperClass == null) {
-                    cacheDescriptorInvalid = true;
-                } else {
-                    snsAddVideoMethod = findSnsAddVideoMethod(snsUploadPackHelperClass);
-                    if (!snsVideoLocatorResolved) {
-                        cacheDescriptorInvalid = true;
-                    } else {
-                        SharedPreferences.Editor videoLocatorEditor = cachePrefs.edit();
-                        putMethod(videoLocatorEditor, "snsAddVideoMethod", snsAddVideoMethod);
-                        videoLocatorEditor.putString(
-                                SNS_VIDEO_LOCATOR_VERSION_KEY, SNS_VIDEO_LOCATOR_VERSION);
-                        if (!videoLocatorEditor.commit()) cacheDescriptorInvalid = true;
+            snsVideoLocatorResolved = snsVideoLocatorVersionCurrent && snsAddVideoMethod != null;
+            if (!snsVideoLocatorResolved && snsUploadPackHelperClass != null) {
+                Method found = findSnsAddVideoMethod(snsUploadPackHelperClass);
+                if (found != null) {
+                    snsAddVideoMethod = found;
+                    SharedPreferences.Editor videoLocatorEditor = cachePrefs.edit();
+                    putMethod(videoLocatorEditor, "snsAddVideoMethod", found);
+                    videoLocatorEditor.putString(
+                            SNS_VIDEO_LOCATOR_VERSION_KEY, SNS_VIDEO_LOCATOR_VERSION);
+                    if (!videoLocatorEditor.commit()) {
+                        logDetail("朋友圈视频定位缓存写入失败");
                     }
                 }
             }
@@ -4579,10 +4602,8 @@ public class DexFinder {
     }
 
     private Method findSnsAddVideoMethod(Class<?> helperClass) {
-        if (helperClass == null) {
-            snsVideoLocatorResolved = true;
-            return null;
-        }
+        snsVideoLocatorResolved = false;
+        if (helperClass == null) return null;
         LinkedHashSet<Method> candidates = new LinkedHashSet<>();
         boolean anchorsComplete = true;
         for (String anchor : new String[]{"addSightObjectByPath", "produceSightByPath"}) {
@@ -4604,13 +4625,14 @@ public class DexFinder {
                 anchorsComplete = false;
             }
         }
-        snsVideoLocatorResolved = anchorsComplete;
         if (!anchorsComplete || candidates.size() != 1) {
             logDetail("朋友圈视频helper定位拒绝: anchorsComplete=" + anchorsComplete
                     + " uniqueAnchoredCandidates=" + candidates.size());
             return null;
         }
-        return KavaReflector.accessible(candidates.iterator().next());
+        Method found = KavaReflector.accessible(candidates.iterator().next());
+        snsVideoLocatorResolved = isSnsAddVideoMethod(helperClass, found);
+        return snsVideoLocatorResolved ? found : null;
     }
 
     private boolean isSnsAddVideoMethod(Class<?> helperClass, Method method) {
@@ -4918,7 +4940,8 @@ public class DexFinder {
             putMethod(editor, "snsAddImageMethod", snsAddImageMethod);
             putMethod(editor, "snsAddVideoMethod", snsAddVideoMethod);
             editor.putString(SNS_VIDEO_LOCATOR_VERSION_KEY,
-                    snsVideoLocatorResolved ? SNS_VIDEO_LOCATOR_VERSION : "");
+                    snsVideoLocatorResolved && isSnsAddVideoMethod(snsUploadPackHelperClass, snsAddVideoMethod)
+                            ? SNS_VIDEO_LOCATOR_VERSION : "");
             putMethod(editor, "snsCommitMethod", snsCommitMethod);
             putMethod(editor, "snsShareAppMsgMethod", snsShareAppMsgMethod);
             putMethod(editor, "snsUploadCheckMethod", snsUploadCheckMethod);
