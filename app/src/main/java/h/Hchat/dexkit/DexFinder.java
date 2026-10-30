@@ -26,6 +26,7 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 
@@ -43,6 +44,8 @@ public class DexFinder {
     private static final String CACHE_KEY = "cache.key";
     private static final String CACHE_SNAPSHOT_VERSION_KEY = "cache.snapshot.version";
     private static final String CACHE_SNAPSHOT_VERSION = "2";
+    private static final String SNS_VIDEO_LOCATOR_VERSION_KEY = "sns.video.locator.version";
+    private static final String SNS_VIDEO_LOCATOR_VERSION = "1";
     private static final String LOCATOR_WISH_COMPLETE = "locator.wish.complete";
     private static final String LOCATOR_PACKET_COMPLETE = "locator.packet.complete";
     private static final String LOCATOR_ECS_COMPLETE = "locator.ecs.complete";
@@ -259,6 +262,7 @@ public class DexFinder {
     private boolean receiveUnionLocatorResolved;
     private boolean openUnionLocatorResolved;
     private boolean networkQueueLocatorResolved;
+    private boolean snsVideoLocatorResolved;
     private boolean wishLocatorResolved;
     private boolean packetCompatLocatorResolved;
     private boolean ecsGiftLocatorResolved;
@@ -3285,9 +3289,15 @@ public class DexFinder {
     }
 
     public void resolveSnsUploadApi() {
-        if (ensureSnapshotLoaded()) return;
+        boolean snapshotLoaded = ensureSnapshotLoaded();
+        if (snsVideoLocatorResolved
+                && !isSnsAddVideoMethod(snsUploadPackHelperClass, snsAddVideoMethod)) {
+            snsVideoLocatorResolved = false;
+        }
+        if (snapshotLoaded && snsVideoLocatorResolved) return;
         try {
-            if (hasSnsUploadApi() && snsAddVideoMethod != null && snsShareAppMsgMethod != null) {
+            if (snsVideoLocatorResolved && hasSnsUploadApi()
+                    && snsAddVideoMethod != null && snsShareAppMsgMethod != null) {
                 return;
             }
 
@@ -3352,6 +3362,10 @@ public class DexFinder {
     }
 
     private void resolveSnsUploadMethods() {
+        if (snsVideoLocatorResolved
+                && !isSnsAddVideoMethod(snsUploadPackHelperClass, snsAddVideoMethod)) {
+            snsVideoLocatorResolved = false;
+        }
         if (snsUploadPackHelperClass != null) {
             if (snsSetContentMethod == null) {
                 snsSetContentMethod = findSnsHelperChainMethod("setContentDes");
@@ -3365,8 +3379,22 @@ public class DexFinder {
             if (snsAddImageMethod == null) {
                 snsAddImageMethod = findSnsAddImageMethod(snsUploadPackHelperClass);
             }
-            if (snsAddVideoMethod == null) {
-                snsAddVideoMethod = findSnsAddVideoMethod(snsUploadPackHelperClass);
+            if (!snsVideoLocatorResolved) {
+                Method found = findSnsAddVideoMethod(snsUploadPackHelperClass);
+                if (found != null) {
+                    snsAddVideoMethod = found;
+                    if (resolvedAll && cachePrefs != null && runtimeCacheKey.length() > 0
+                            && DexCacheIdentity.sameRuntime(runtimeCacheKey,
+                                    cachePrefs.getString(CACHE_KEY, ""))) {
+                        SharedPreferences.Editor videoLocatorEditor = cachePrefs.edit();
+                        putMethod(videoLocatorEditor, "snsAddVideoMethod", found);
+                        videoLocatorEditor.putString(
+                                SNS_VIDEO_LOCATOR_VERSION_KEY, SNS_VIDEO_LOCATOR_VERSION);
+                        if (!videoLocatorEditor.commit()) {
+                            logDetail("朋友圈视频定位缓存写入失败");
+                        }
+                    }
+                }
             }
             if (snsCommitMethod == null) {
                 snsCommitMethod = findSnsCommitMethod(snsUploadPackHelperClass);
@@ -3693,7 +3721,30 @@ public class DexFinder {
             snsSetSdkIdMethod = loadMethod("snsSetSdkIdMethod");
             snsSetSdkAppNameMethod = loadMethod("snsSetSdkAppNameMethod");
             snsAddImageMethod = loadMethod("snsAddImageMethod");
+            // A bad optional video descriptor must not invalidate unrelated cached APIs.
+            boolean cacheInvalidBeforeSnsVideo = cacheDescriptorInvalid;
             snsAddVideoMethod = loadMethod("snsAddVideoMethod");
+            cacheDescriptorInvalid = cacheInvalidBeforeSnsVideo;
+            boolean snsVideoLocatorVersionCurrent = SNS_VIDEO_LOCATOR_VERSION.equals(
+                    cachePrefs.getString(SNS_VIDEO_LOCATOR_VERSION_KEY, ""));
+            if (snsAddVideoMethod != null
+                    && !isSnsAddVideoMethod(snsUploadPackHelperClass, snsAddVideoMethod)) {
+                snsAddVideoMethod = null;
+            }
+            snsVideoLocatorResolved = snsVideoLocatorVersionCurrent && snsAddVideoMethod != null;
+            if (!snsVideoLocatorResolved && snsUploadPackHelperClass != null) {
+                Method found = findSnsAddVideoMethod(snsUploadPackHelperClass);
+                if (found != null) {
+                    snsAddVideoMethod = found;
+                    SharedPreferences.Editor videoLocatorEditor = cachePrefs.edit();
+                    putMethod(videoLocatorEditor, "snsAddVideoMethod", found);
+                    videoLocatorEditor.putString(
+                            SNS_VIDEO_LOCATOR_VERSION_KEY, SNS_VIDEO_LOCATOR_VERSION);
+                    if (!videoLocatorEditor.commit()) {
+                        logDetail("朋友圈视频定位缓存写入失败");
+                    }
+                }
+            }
             snsCommitMethod = loadMethod("snsCommitMethod");
             snsShareAppMsgMethod = loadMethod("snsShareAppMsgMethod");
             snsUploadCheckMethod = loadMethod("snsUploadCheckMethod");
@@ -4551,46 +4602,42 @@ public class DexFinder {
     }
 
     private Method findSnsAddVideoMethod(Class<?> helperClass) {
+        snsVideoLocatorResolved = false;
         if (helperClass == null) return null;
-        try {
-            List<MethodData> methods = dexKit.findMethod(
-                    mkMethodUsingStrings("addSightObjectByPath"));
-            for (MethodData methodData : methods) {
-                try {
-                    Method method = methodData.getMethodInstance(classLoader);
-                    if (method.getDeclaringClass() != helperClass) continue;
-                    if (method.getReturnType() != boolean.class) continue;
-                    Class<?>[] params = method.getParameterTypes();
-                    if (params.length == 4
-                            && params[0] == String.class
-                            && params[1] == String.class
-                            && params[2] == String.class
-                            && params[3] == String.class) {
-                        return KavaReflector.accessible(method);
+        LinkedHashSet<Method> candidates = new LinkedHashSet<>();
+        boolean anchorsComplete = true;
+        for (String anchor : new String[]{"addSightObjectByPath", "produceSightByPath"}) {
+            try {
+                List<MethodData> methods = dexKit.findMethod(mkMethodUsingStrings(anchor));
+                if (methods == null) {
+                    anchorsComplete = false;
+                    continue;
+                }
+                for (MethodData data : methods) {
+                    try {
+                        Method method = data.getMethodInstance(classLoader);
+                        if (isSnsAddVideoMethod(helperClass, method)) candidates.add(method);
+                    } catch (Throwable ignored) {
+                        anchorsComplete = false;
                     }
-                } catch (Throwable ignored) {}
+                }
+            } catch (Throwable ignored) {
+                anchorsComplete = false;
             }
-        } catch (Throwable ignored) {}
-        try {
-            List<MethodData> methods = dexKit.findMethod(
-                    mkMethodUsingStrings("produceSightByPath"));
-            for (MethodData methodData : methods) {
-                try {
-                    Method method = methodData.getMethodInstance(classLoader);
-                    if (method.getDeclaringClass() != helperClass) continue;
-                    if (method.getReturnType() != boolean.class) continue;
-                    Class<?>[] params = method.getParameterTypes();
-                    if (params.length == 4
-                            && params[0] == String.class
-                            && params[1] == String.class
-                            && params[2] == String.class
-                            && params[3] == String.class) {
-                        return KavaReflector.accessible(method);
-                    }
-                } catch (Throwable ignored) {}
-            }
-        } catch (Throwable ignored) {}
-        return null;
+        }
+        if (!anchorsComplete || candidates.size() != 1) {
+            logDetail("朋友圈视频helper定位拒绝: anchorsComplete=" + anchorsComplete
+                    + " uniqueAnchoredCandidates=" + candidates.size());
+            return null;
+        }
+        Method found = KavaReflector.accessible(candidates.iterator().next());
+        snsVideoLocatorResolved = isSnsAddVideoMethod(helperClass, found);
+        return snsVideoLocatorResolved ? found : null;
+    }
+
+    private boolean isSnsAddVideoMethod(Class<?> helperClass, Method method) {
+        return h.Hchat.hooks.api.sns.SnsVideoRequestArguments
+                .isCompatibleMethod(helperClass, method);
     }
 
     private Method findSnsCommitMethod(Class<?> helperClass) {
@@ -4892,6 +4939,9 @@ public class DexFinder {
             putMethod(editor, "snsSetSdkAppNameMethod", snsSetSdkAppNameMethod);
             putMethod(editor, "snsAddImageMethod", snsAddImageMethod);
             putMethod(editor, "snsAddVideoMethod", snsAddVideoMethod);
+            editor.putString(SNS_VIDEO_LOCATOR_VERSION_KEY,
+                    snsVideoLocatorResolved && isSnsAddVideoMethod(snsUploadPackHelperClass, snsAddVideoMethod)
+                            ? SNS_VIDEO_LOCATOR_VERSION : "");
             putMethod(editor, "snsCommitMethod", snsCommitMethod);
             putMethod(editor, "snsShareAppMsgMethod", snsShareAppMsgMethod);
             putMethod(editor, "snsUploadCheckMethod", snsUploadCheckMethod);
